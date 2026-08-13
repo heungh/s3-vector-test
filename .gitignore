@@ -1,0 +1,38 @@
+# secrets / local config
+.env
+.env.local
+*.pem
+*.key
+
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
+ingestion/build/
+backend/build/
+backend/function.zip
+ingest_manifest.json
+
+# node / next
+node_modules/
+web/.next/
+web/out/
+web/.env.local
+
+# vendored libs fetched at build time (see infra/deploy.sh)
+web/public/vendor/
+web/package-lock.json
+
+# build/deploy artifacts
+*.zip
+
+# OS
+.DS_Store
+Thumbs.db
+
+# non-source / large binaries (never commit)
+*.pptx
+*.xlsx
+*.mp4
+*.ipynb
