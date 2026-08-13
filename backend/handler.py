@@ -96,7 +96,9 @@ def _search_opensearch(vec, topk):
             "keywords": s.get("keywords", ""),
             "thumb_url": s.get("thumb_url", ""),
             "preview_url": s.get("preview_url") or s.get("thumb_url", ""),
-            "score": min(1.0, float(h.get("_score", 0.0))),
+            # OpenSearch lucene cosinesimil _score = (1 + cosine) / 2  ->  convert to true
+            # cosine similarity so it is comparable with S3 Vectors (1 - distance) during fusion.
+            "score": max(0.0, min(1.0, 2.0 * float(h.get("_score", 0.0)) - 1.0)),
             "tier": "opensearch",
         })
     return out

@@ -26,7 +26,9 @@ Edit `.env`:
 | `PROJECT_NAME` | Prefix for all resource names. |
 | `OPENSEARCH_INSTANCE_TYPE` | `r6g.large.search` (recommended for k-NN), `m6g.large.search`, or `t3.small.search` (dev). |
 | `EMBED_MODEL_ID` / `EMBED_DIM` | Embedding model + dimension (`cohere.embed-v4:0` / `1024`). |
-| `INGEST_LIMIT` / `HOT_LIMIT` | How many images to embed (S3 Vectors) / mirror to OpenSearch. |
+| `INGEST_LIMIT` | How many images to embed into S3 Vectors (the full catalog). |
+| `HOT_PCT` | Top X% (by popularity) copied into OpenSearch (hot tier), no re-embedding. |
+| `INGEST_EMBED_MODEL_ID` | Bulk-embed model; `us.cohere.embed-v4:0` (cross-region profile) for higher throughput. |
 | `ORIGIN_SECRET` | Leave blank to auto-generate. |
 | `DATA_DIR` | Optional — path to your own JSONL dataset (defaults to the bundled sample). |
 
@@ -42,7 +44,8 @@ This will:
 1. Package the Lambda and upload it to a deploy bucket.
 2. Create the S3 Vectors bucket + index.
 3. Deploy the CloudFormation stack (OpenSearch, Lambda, API Gateway, CloudFront, S3).
-4. Embed the sample images into S3 Vectors and mirror a hot subset into OpenSearch.
+4. Embed images **once** (multi-region for throughput) into S3 Vectors (full catalog), then copy
+   the top `HOT_PCT`% by popularity into OpenSearch — **without re-embedding**.
 5. Build the Next.js app (static export) and upload it; invalidate CloudFront.
 
 ⏱️ The OpenSearch domain takes ~10–20 minutes to become active on first deploy.

@@ -20,7 +20,10 @@ EMBED_DIM="${EMBED_DIM:-1024}"
 VECTOR_INDEX="${VECTOR_INDEX:-image-embeddings}"
 OPENSEARCH_INDEX="${OPENSEARCH_INDEX:-images-hot}"
 INGEST_LIMIT="${INGEST_LIMIT:-300}"
-HOT_LIMIT="${HOT_LIMIT:-150}"
+HOT_PCT="${HOT_PCT:-20}"
+# For bulk ingestion throughput, use the US cross-region inference profile (spreads embedding
+# load across multiple regions). Falls back to the direct model if you prefer single-region.
+INGEST_EMBED_MODEL_ID="${INGEST_EMBED_MODEL_ID:-us.cohere.embed-v4:0}"
 export AWS_REGION
 
 ACCOUNT="$(aws sts get-caller-identity --query Account --output text)"
@@ -74,10 +77,14 @@ get_output () {
 CF_URL="$(get_output CloudFrontURL)"
 DIST_ID="$(get_output DistributionId)"
 
-# ---- 4. ingest sample images ----
-echo "== embedding + ingesting sample images =="
-python3 "$ROOT/ingestion/embed_and_ingest.py" --limit "$INGEST_LIMIT" --no-opensearch
-python3 "$ROOT/ingestion/backfill_opensearch.py" --hot "$HOT_LIMIT"
+# ---- 4. ingest images ----
+# Embed ONCE and store the FULL set in S3 Vectors (source of truth), then copy the top
+# HOT_PCT% (by popularity) into OpenSearch WITHOUT re-embedding (hot tier).
+echo "== embedding (multi-region) + ingesting into S3 Vectors =="
+EMBED_MODEL_ID="$INGEST_EMBED_MODEL_ID" python3 "$ROOT/ingestion/parallel_ingest.py" \
+  --limit "$INGEST_LIMIT" --dl-workers 48 --embed-batch 12 --embed-workers 24 --put-batch 300
+echo "== copying hot ${HOT_PCT}% into OpenSearch (no re-embedding) =="
+python3 "$ROOT/ingestion/backfill_hot.py" --pct "$HOT_PCT"
 
 # ---- 5. build + upload web ----
 echo "== building web app =="

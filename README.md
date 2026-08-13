@@ -37,6 +37,49 @@ CloudFront ──(secret header)──► API Gateway ──► Lambda (private)
 
 All of the above is orchestrated by **`infra/deploy.sh`**.
 
+## Data tiering: S3 Vectors (full) + OpenSearch (hot 20%)
+
+The two stores are **not** disjoint partitions. Images are **embedded once**, and the vector is
+written to both stores — you never pay to embed the same image twice.
+
+- **S3 Vectors = 100% of the catalog** — the single source of truth (serverless, ~90% cheaper).
+- **OpenSearch = the top ~`HOT_PCT`% (by popularity) copied from S3 Vectors** — the low-latency
+  "hot" tier. `ingestion/backfill_hot.py` reads the ingest manifest, picks the most popular
+  vectors, and **copies them (no re-embedding)** into OpenSearch.
+
+Because OpenSearch holds only a hot subset, the hybrid search naturally demonstrates the
+**"not in OpenSearch → served by S3 Vectors"** fallback:
+
+| Query type | Where results come from (hybrid mode) |
+|------------|----------------------------------------|
+| Common / popular | mostly **OpenSearch** (hot tier, sub-second) |
+| Long-tail / niche | mostly **S3 Vectors** (the items OpenSearch doesn't have) |
+
+The API returns each result's `tier` (`opensearch` or `s3vectors`), and the UI colors them
+(green = OpenSearch, purple = S3 Vectors), so the fallback is visible per result. Scores from both
+engines are normalized to a common cosine similarity before fusion so ranking is fair across tiers.
+
+## Multi-region embedding (throughput)
+
+Embedding is the slow/expensive step (download image → Bedrock call), and a single region is
+capped by that region's Bedrock throughput quota. To go faster, the bulk ingester
+(`ingestion/parallel_ingest.py`) does **concurrent downloads + batched, concurrent Cohere Embed v4
+calls + batched `put_vectors`**, and by default uses the **US cross-region inference profile**
+`us.cohere.embed-v4:0` (set via `INGEST_EMBED_MODEL_ID`), which spreads embedding load across
+multiple US regions — the AWS-native way to exceed a single region's quota.
+
+Measured on this project's data:
+
+| Approach | Throughput | 851,485 images |
+|----------|-----------|----------------|
+| Sequential, 1 image/call | ~2.3 vec/s | ~110 h |
+| Parallel + batched, 1 region | ~53 vec/s | ~4.5 h |
+| Parallel + batched, **cross-region profile** | ~75–90 vec/s | ~3 h |
+
+`put_vectors` and image downloads are **not** the bottleneck — the embedding quota is. Raising the
+Bedrock quota (or fanning the pipeline out to per-region workers) scales throughput further.
+Multi-region only reduces wall-clock time; the embedding **cost is the same** (one call per image).
+
 ## Quick start
 
 ```bash
