@@ -1,0 +1,5 @@
+boto3>=1.40.0
+requests>=2.31.0
+opensearch-py>=2.6.0
+requests-aws4auth>=1.2.3
+tqdm>=4.66.0

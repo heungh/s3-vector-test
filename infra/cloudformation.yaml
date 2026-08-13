@@ -1,0 +1,269 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  S3 Vectors x OpenSearch hybrid image search demo — private Lambda (API Gateway + CloudFront
+  secret header), managed OpenSearch domain, and CloudFront-hosted static web app.
+  NOTE: the S3 Vectors bucket/index and data ingestion are created by deploy.sh (S3 Vectors is
+  not yet a CloudFormation resource type).
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: s3-vector-demo
+  VectorBucketName:
+    Type: String
+    Description: S3 Vectors bucket name (created by deploy.sh).
+  VectorIndexName:
+    Type: String
+    Default: image-embeddings
+  OpenSearchIndexName:
+    Type: String
+    Default: images-hot
+  OpenSearchInstanceType:
+    Type: String
+    Default: r6g.large.search
+  EmbedModelId:
+    Type: String
+    Default: cohere.embed-v4:0
+  EmbedDim:
+    Type: String
+    Default: "1024"
+  OriginSecret:
+    Type: String
+    NoEcho: true
+    Description: Shared secret header that only CloudFront injects (gate for API Gateway).
+  LambdaCodeBucket:
+    Type: String
+    Description: S3 bucket holding the packaged Lambda zip (uploaded by deploy.sh).
+  LambdaCodeKey:
+    Type: String
+    Default: lambda/function.zip
+  AdminPrincipalArn:
+    Type: String
+    Default: ""
+    Description: Optional IAM principal ARN allowed to call OpenSearch for ingestion. Empty = account root.
+
+Conditions:
+  NoAdminArn: !Equals [!Ref AdminPrincipalArn, ""]
+
+Resources:
+
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-search-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: search-policy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: bedrock:InvokeModel
+                Resource: !Sub "arn:aws:bedrock:${AWS::Region}::foundation-model/${EmbedModelId}"
+              - Effect: Allow
+                Action: [s3vectors:QueryVectors, s3vectors:GetVectors, s3vectors:ListVectors]
+                Resource: "*"
+              - Effect: Allow
+                Action: [es:ESHttpGet, es:ESHttpPost, es:ESHttpPut]
+                Resource: !Sub "arn:aws:es:${AWS::Region}:${AWS::AccountId}:domain/${ProjectName}-os/*"
+              - Effect: Allow
+                Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents]
+                Resource: "*"
+
+  OpenSearchDomain:
+    Type: AWS::OpenSearchService::Domain
+    Properties:
+      DomainName: !Sub "${ProjectName}-os"
+      EngineVersion: OpenSearch_2.13
+      ClusterConfig:
+        InstanceType: !Ref OpenSearchInstanceType
+        InstanceCount: 1
+        DedicatedMasterEnabled: false
+        ZoneAwarenessEnabled: false
+      EBSOptions:
+        EBSEnabled: true
+        VolumeType: gp3
+        VolumeSize: 10
+      NodeToNodeEncryptionOptions: { Enabled: true }
+      EncryptionAtRestOptions: { Enabled: true }
+      DomainEndpointOptions: { EnforceHTTPS: true }
+      AccessPolicies:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS:
+                - !GetAtt LambdaRole.Arn
+                - !If [NoAdminArn, !Sub "arn:aws:iam::${AWS::AccountId}:root", !Ref AdminPrincipalArn]
+            Action: es:ESHttp*
+            Resource: !Sub "arn:aws:es:${AWS::Region}:${AWS::AccountId}:domain/${ProjectName}-os/*"
+
+  SearchLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-search"
+      Runtime: python3.12
+      Handler: handler.handler
+      Role: !GetAtt LambdaRole.Arn
+      Timeout: 30
+      MemorySize: 512
+      Code:
+        S3Bucket: !Ref LambdaCodeBucket
+        S3Key: !Ref LambdaCodeKey
+      Environment:
+        Variables:
+          VECTOR_BUCKET: !Ref VectorBucketName
+          VECTOR_INDEX: !Ref VectorIndexName
+          OPENSEARCH_ENDPOINT: !Sub "https://${OpenSearchDomain.DomainEndpoint}"
+          OPENSEARCH_INDEX: !Ref OpenSearchIndexName
+          EMBED_MODEL_ID: !Ref EmbedModelId
+          EMBED_DIM: !Ref EmbedDim
+          ORIGIN_SECRET: !Ref OriginSecret
+
+  HttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub "${ProjectName}-api"
+      ProtocolType: HTTP
+
+  ApiIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt SearchLambda.Arn
+      PayloadFormatVersion: "2.0"
+      IntegrationMethod: POST
+
+  ApiRouteProxy:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: "ANY /{proxy+}"
+      Target: !Sub "integrations/${ApiIntegration}"
+
+  ApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref HttpApi
+      StageName: "$default"
+      AutoDeploy: true
+
+  LambdaApiPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref SearchLambda
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*/*"
+
+  WebBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${ProjectName}-${AWS::AccountId}-web"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  S3OAC:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub "${ProjectName}-s3-oac"
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  RewriteFunction:
+    Type: AWS::CloudFront::Function
+    Properties:
+      Name: !Sub "${ProjectName}-rewrite"
+      AutoPublish: true
+      FunctionConfig:
+        Comment: Append index.html for directory-style paths
+        Runtime: cloudfront-js-2.0
+      FunctionCode: |
+        function handler(event) {
+          var request = event.request;
+          var uri = request.uri;
+          if (uri.endsWith('/')) { request.uri += 'index.html'; }
+          else if (!uri.split('/').pop().includes('.')) { request.uri += '/index.html'; }
+          return request;
+        }
+
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Ref ProjectName
+        DefaultRootObject: index.html
+        PriceClass: PriceClass_100
+        Origins:
+          - Id: s3origin
+            DomainName: !GetAtt WebBucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt S3OAC.Id
+            S3OriginConfig:
+              OriginAccessIdentity: ""
+          - Id: apiorigin
+            DomainName: !Sub "${HttpApi}.execute-api.${AWS::Region}.amazonaws.com"
+            CustomOriginConfig:
+              OriginProtocolPolicy: https-only
+              OriginSSLProtocols: [TLSv1.2]
+            OriginCustomHeaders:
+              - HeaderName: x-origin-secret
+                HeaderValue: !Ref OriginSecret
+        DefaultCacheBehavior:
+          TargetOriginId: s3origin
+          ViewerProtocolPolicy: redirect-to-https
+          Compress: true
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6   # CachingOptimized
+          FunctionAssociations:
+            - EventType: viewer-request
+              FunctionARN: !GetAtt RewriteFunction.FunctionMetadata.FunctionARN
+        CacheBehaviors:
+          - PathPattern: "/api/*"
+            TargetOriginId: apiorigin
+            ViewerProtocolPolicy: redirect-to-https
+            Compress: false
+            AllowedMethods: [GET, HEAD, OPTIONS, PUT, POST, PATCH, DELETE]
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad   # CachingDisabled
+            OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac  # AllViewerExceptHostHeader
+
+  WebBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref WebBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowCloudFrontOAC
+            Effect: Allow
+            Principal: { Service: cloudfront.amazonaws.com }
+            Action: s3:GetObject
+            Resource: !Sub "arn:aws:s3:::${WebBucket}/*"
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/${Distribution}"
+
+Outputs:
+  CloudFrontURL:
+    Description: Public site URL
+    Value: !Sub "https://${Distribution.DomainName}/"
+  DistributionId:
+    Value: !Ref Distribution
+  WebBucketName:
+    Value: !Ref WebBucket
+  ApiEndpoint:
+    Value: !Sub "https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com"
+  OpenSearchEndpoint:
+    Value: !Sub "https://${OpenSearchDomain.DomainEndpoint}"
+  LambdaRoleArn:
+    Value: !GetAtt LambdaRole.Arn
