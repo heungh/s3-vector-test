@@ -98,6 +98,97 @@ API는 각 결과의 `tier`(`opensearch` 또는 `s3vectors`)를 반환하고 UI�
 > **TODO(데모 완료 후):** 동일 데이터셋으로 Batch Inference 버전(입력 JSONL 생성 → 작업 제출 → 결과를 S3 Vectors에 적재)을
 > 구현해 실제 **비용/소요 시간**을 실시간 병렬 방식과 비교한다. (해당 임베딩 모델의 배치 추론 지원 여부 확인 필요)
 
+## 핵심 로직 (소스 코드)
+
+### A. 멀티리전 병렬 임베딩 적재 — `ingestion/parallel_ingest.py`
+
+청크 단위 스트리밍으로 **동시 다운로드 → 배치·동시 임베딩 → 배치 put_vectors** 를 수행합니다.
+
+```python
+for chunk in chunks(common.iter_records(limit, skip), a.chunk):   # ① JSONL 청크(예: 5000)
+    # ② 동시 다운로드 (I/O 바운드)
+    with ThreadPoolExecutor(max_workers=a.dl_workers) as ex:      # 예: 64
+        downloaded = [r for r in ex.map(download, chunk) if r]    # 이미지→base64
+
+    # ③ 배치로 묶어 동시 임베딩
+    batches = [downloaded[i:i+a.embed_batch] for i in range(0, len(downloaded), a.embed_batch)]  # 12장/배치
+    with ThreadPoolExecutor(max_workers=a.embed_workers) as ex:   # 예: 28 동시 호출
+        for res in ex.map(_safe_embed, batches):
+            embedded.extend(res)
+
+    # ④ 배치 put_vectors (동시)
+    pbatches = [embedded[i:i+a.put_batch] for i in range(0, len(embedded), a.put_batch)]           # 300개/put
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        for n in ex.map(put_batch, pbatches):
+            done += n
+```
+
+한 번의 `InvokeModel` 호출에 **여러 이미지**를 담아 임베딩(마이크로 배치):
+```python
+def embed_batch(recs):
+    body = {"images": [r["_b64"] for r in recs], "input_type": "image",
+            "output_dimension": 1024, "embedding_types": ["float"]}
+    resp = _br.invoke_model(modelId=config.EMBED_MODEL_ID, body=json.dumps(body))   # us.cohere.embed-v4:0 (크로스리전)
+    for r, v in zip(recs, json.loads(resp["body"].read())["embeddings"]["float"]):
+        r["_vec"] = v
+    return recs
+```
+> **멀티리전은 코드가 리전을 나누는 게 아니라**, `EMBED_MODEL_ID`를 크로스리전 추론 프로파일 `us.cohere.embed-v4:0`로
+> 지정하면 AWS가 여러 US 리전으로 자동 분산합니다. 코드는 `embed_workers`로 동시 호출 수만 늘립니다.
+
+배치·동시성 숫자의 근거(엄밀 최적화가 아니라 API 제약 + 실측 기반 기본값):
+
+| 파라미터 | 값 | 근거 | 상한/병목 |
+|---|---|---|---|
+| `embed-batch` | 12 | 요청 페이로드(~0.5MB) + 호출 오버헤드 균형 | 요청 크기·모델 배치 한도 |
+| `put-batch` | 300 | 요청 수↓, ~1.8MB 이내 | `put_vectors` 상한(~500)·페이로드 |
+| `dl-workers` | 64 | I/O 동시성으로 CDN 포화 | 로컬 대역폭·CDN |
+| `embed-workers` | 28 | Bedrock 동시성 확보 | **Bedrock 쿼터(실제 병목)** |
+
+측정 시 ~53 vec/s(단일 리전) → ~75–90 vec/s(크로스리전)에서 평탄화 → 병목은 Bedrock 임베딩 쿼터. 쿼터 상향 시 더 빨라짐.
+
+### B. 검색 — `backend/handler.py`
+
+공통: 쿼리 임베딩(`input_type="search_query"`) — 이미지와 같은 공간이라 텍스트→이미지 매칭.
+```python
+def _embed_query(text):
+    body = {"texts": [text], "input_type": "search_query", "output_dimension": 1024, "embedding_types": ["float"]}
+    return json.loads(_br.invoke_model(...)["body"].read())["embeddings"]["float"][0]
+```
+
+**OpenSearch(핫)** — SigV4(service `es`) 서명 k-NN, 점수를 진짜 코사인으로 환산:
+```python
+payload = {"size": topk, "query": {"knn": {"vector": {"vector": vec, "k": topk}}}, "_source": [...]}
+SigV4Auth(creds, "es", REGION).add_auth(aws_req)   # IAM 접근 도메인 → 요청 서명
+# lucene cosinesimil _score = (1+cos)/2  ->  진짜 코사인으로 환산해 S3 Vectors와 비교 가능하게
+"score": max(0.0, min(1.0, 2.0 * float(h["_score"]) - 1.0)), "tier": "opensearch"
+```
+
+**S3 Vectors(전체)** — `query_vectors`, 코사인 거리→유사도:
+```python
+resp = _s3v.query_vectors(vectorBucketName=..., indexName=..., queryVector={"float32": vec},
+                          topK=topk, returnDistance=True, returnMetadata=True)
+"score": max(0.0, 1.0 - float(v["distance"])), "tier": "s3vectors"
+```
+
+**하이브리드 = 병행 조회 + 리랭크(융합)**:
+```python
+with ThreadPoolExecutor(max_workers=2) as ex:                     # 두 티어 동시 조회
+    fut_os = ex.submit(_search_opensearch, vec, topk) if want_os else None
+    fut_s3 = ex.submit(_search_s3vectors,  vec, topk) if want_s3 else None
+
+def _fuse(lists, topk):
+    best = {}
+    for lst in lists:
+        for r in lst:
+            k = r["image_id"]
+            if k not in best or r["score"] > best[k]["score"]:    # image_id 중복 제거 → 높은 점수 채택
+                best[k] = r
+    return sorted(best.values(), key=lambda x: x["score"], reverse=True)[:topk]   # 코사인 유사도 내림차순
+```
+점수를 동일 코사인 척도로 정규화했기에 공정한 재랭킹이 되고, 그 결과 **흔한 쿼리는 OpenSearch가, 롱테일은 S3 Vectors가**
+상위를 차지하며 "OpenSearch에 없으면 S3 Vectors가 채우는" 폴백이 발생합니다.
+
 ## 빠른 시작
 
 ```bash
