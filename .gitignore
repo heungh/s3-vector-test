@@ -36,3 +36,6 @@ Thumbs.db
 *.xlsx
 *.mp4
 *.ipynb
+
+# datasets (never commit third-party image metadata / URLs) — bring your own via DATA_DIR
+ingestion/sample_data/
